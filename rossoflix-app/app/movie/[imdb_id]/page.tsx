@@ -47,7 +47,7 @@ export default async function MovieDetailPage({ params }: Props) {
               <p>{t.title || "Unnamed torrent"}</p>
               {t.infoHash && <p>Hash: {t.infoHash}</p>}
               <a
-                href={`/stream?filename=${encodeURIComponent(filename)}&magnet=${encodeURIComponent(t.infoHash)}`}
+                href={`/stream?magnet=${encodeURIComponent(t.infoHash)}&filename=${encodeURIComponent(filename)}`}
                 target="_blank"
                 rel="noopener noreferrer"
               >

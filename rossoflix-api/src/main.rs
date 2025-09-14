@@ -1,11 +1,11 @@
-use std::{io, net::SocketAddr, path::PathBuf, process::Command, time::Duration};
+use std::{io, net::SocketAddr, path::{Path as StdPath, PathBuf}, time::Duration};
 
 use axum::{
     Json, Router,
     body::Body,
     extract::{Path, Query, State},
-    http::{Response, StatusCode, header},
-    response::IntoResponse,
+    http::{StatusCode, header, HeaderMap},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use dotenvy::dotenv;
@@ -13,12 +13,17 @@ use moka::future::Cache;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::process::Command;
+use tokio::fs;
 use tokio::fs::File;
 use tokio::net::TcpListener;
 use tokio_util::io::ReaderStream;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
+use futures_util::StreamExt; // <-- Adicione esta linha!
+// Linha opcional, mas recomendada para a versão melhorada:
+use tokio::io::{AsyncSeekExt, SeekFrom};
 
 #[derive(Clone)]
 struct AppState {
@@ -166,7 +171,8 @@ async fn main() -> io::Result<()> {
             "/torrentio/show/:imdb_id/:season/:episode",
             get(torrentio_episode),
         )
-        .route("/stream-torrent", axum::routing::get(download_and_stream))
+        // .route("/stream", axum::routing::get(download_and_stream))
+        .route("/stream", axum::routing::get(download_and_stream))
         .with_state(state)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -368,46 +374,139 @@ struct TorrentParams {
     filename: String, // nome do arquivo a ser servido
 }
 
-async fn download_and_stream(Query(params): Query<TorrentParams>) -> impl IntoResponse {
-    let download_dir = PathBuf::from("./downloads");
-    tokio::fs::create_dir_all(&download_dir).await.unwrap();
+async fn find_downloaded_file(base_dir: &StdPath, filename: &str) -> Option<PathBuf> {
+    let mut entries = match fs::read_dir(base_dir).await {
+        Ok(rd) => rd,
+        Err(_) => return None,
+    };
 
-    let filepath = download_dir.join(&params.filename);
-
-    // If the file doesn't exist, download it
-    if !filepath.exists() {
-        let status = Command::new("aria2c")
-            .arg("--dir")
-            .arg(&download_dir)
-            .arg("--out")
-            .arg(&params.filename)
-            .arg("--seed-time=0")
-            .arg(&params.magnet)
-            .status(); // <-- ERROR 1: Missing .await here
-
-        match status {
-            Ok(s) if s.success() => (),
-            _ => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Download failed").into_response();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.is_file() && path.file_name().map(|n| n == filename).unwrap_or(false) {
+            return Some(path);
+        } else if path.is_dir() {
+            // Aqui criamos uma future "boxed" para a chamada recursiva
+            if let Some(found) = Box::pin(find_downloaded_file(&path, filename)).await {
+                return Some(found);
             }
         }
     }
 
-    // Stream the file
-    let file = match File::open(&filepath).await {
-        Ok(f) => f,
-        Err(_) => return (StatusCode::NOT_FOUND, "File not found").into_response(),
+    None
+}
+async fn download_and_stream(Query(params): Query<TorrentParams>, headers: HeaderMap) -> Result<Response, (StatusCode, String)>  {
+    let download_dir = PathBuf::from("./downloads");
+    tokio::fs::create_dir_all(&download_dir).await.unwrap();
+
+    let filepath = match find_downloaded_file(&download_dir, &params.filename).await {
+        Some(p) => p,
+        None => {
+            println!("File not found, starting aria2c download...");
+
+            let magnet_link = if params.magnet.starts_with("magnet:?") {
+                params.magnet.clone()
+            } else {
+                format!("magnet:?xt=urn:btih:{}", params.magnet)
+            };
+
+            let status = Command::new("aria2c")
+                .arg("--dir")
+                .arg(&download_dir)
+                .arg("--out")
+                .arg(&params.filename)
+                .arg("--seed-time=0")
+                .arg(magnet_link)
+                .arg("--enable-dht=true")
+                .arg("--enable-peer-exchange=true")
+                .arg("--bt-tracker=udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.cyberia.is:6969/announce")
+                .status()
+                .await;
+
+
+            println!("aria2c finished: {:?}", status);
+
+            if !matches!(status, Ok(s) if s.success()) {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Download failed")));
+            }
+
+            find_downloaded_file(&download_dir, &params.filename).await
+                .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "File not found after download".to_string()))?
+            
+        }
     };
 
-    let stream = ReaderStream::new(file);
+    println!("Checking file at {:?}", filepath);
 
-    // Create a body from the stream for Axum
+    // Stream the file
+    if !filepath.exists() {
+        return Err((StatusCode::NOT_FOUND, "Video not found".to_string()));
+    }
+
+    let mut file = match File::open(&filepath).await {
+        Ok(file) => file,
+        Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to open video file: {}", err))),
+    };
+
+    let meta = match file.metadata().await {
+        Ok(meta) => meta,
+        Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get video metadata: {}", err))),
+    };
+    let file_size = meta.len();
+
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|s| s.strip_prefix("bytes="));
+
+    if let Some(range) = range {
+        let (start, end) = parse_range(range, file_size).unwrap_or((0, file_size - 1));
+        let chunk_size = (end - start) + 1;
+
+        // Mover o cursor do arquivo para o 'start' do range
+        if let Err(err) = file.seek(SeekFrom::Start(start)).await {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to seek file: {}", err)));
+        }
+
+        // Criar um stream que lê apenas o 'chunk_size' necessário
+        let stream = ReaderStream::new(file).take(chunk_size as usize);
+
+        let body = Body::from_stream(stream);
+
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end, file_size).parse().unwrap(),
+        );
+        response_headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+        response_headers.insert(header::CONTENT_LENGTH, chunk_size.to_string().parse().unwrap());
+        response_headers.insert(header::CONTENT_TYPE, "video/mp4".parse().unwrap());
+
+        return Ok((StatusCode::PARTIAL_CONTENT, response_headers, body).into_response());
+    }
+
+    // Se não houver 'Range', transmite o arquivo inteiro
+    let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
 
-    Response::builder()
-        .header(header::CONTENT_TYPE, "video/mp4") // Note: You might want to determine this dynamically
-        .header(header::ACCEPT_RANGES, "bytes")
-        .body(body)
-        .unwrap()
-        .into_response()
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(header::CONTENT_TYPE, "video/mp4".parse().unwrap());
+    response_headers.insert(header::CONTENT_LENGTH, file_size.to_string().parse().unwrap());
+    response_headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+
+    Ok((StatusCode::OK, response_headers, body).into_response())
+}
+
+fn parse_range(range_str: &str, file_size: u64) -> Option<(u64, u64)> {
+    let mut parts = range_str.split('-');
+    let start = parts.next()?.parse::<u64>().ok()?;
+    let end = match parts.next() {
+        Some("") | None => file_size - 1,
+        Some(end_str) => end_str.parse::<u64>().ok()?,
+    };
+
+    if start > end || end >= file_size {
+        return None;
+    }
+
+    Some((start, end))
 }

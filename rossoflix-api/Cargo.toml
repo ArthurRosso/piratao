@@ -18,9 +18,12 @@ tower-http = { version = "0.5", features = [
     "compression-br",
     "trace",
     "cors",
+    "fs",
 ] }
 moka = { version = "0.12", features = ["future"] }
 dotenvy = "0.15"
 http = "1"
 urlencoding = "2"
 tokio-util = "0.7.16"
+headers = "0.4"
+futures-util = "0.3"
