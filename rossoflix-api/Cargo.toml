@@ -1,0 +1,26 @@
+[package]
+name = "rossoflix-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "gzip", "brotli"] }
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tower = { version = "0.5", features = ["timeout", "util"] }
+tower-http = { version = "0.5", features = [
+    "compression-gzip",
+    "compression-br",
+    "trace",
+    "cors",
+] }
+moka = { version = "0.12", features = ["future"] }
+dotenvy = "0.15"
+http = "1"
+urlencoding = "2"
+tokio-util = "0.7.16"
