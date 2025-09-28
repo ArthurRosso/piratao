@@ -1,4 +1,5 @@
 use std::{io, net::SocketAddr, path::{Path as StdPath, PathBuf}, time::Duration};
+use std::collections::HashSet;
 
 use axum::{
     Json, Router,
@@ -25,12 +26,36 @@ use futures_util::StreamExt; // <-- Adicione esta linha!
 // Linha opcional, mas recomendada para a versão melhorada:
 use tokio::io::{AsyncSeekExt, SeekFrom};
 
+
+
 #[derive(Clone)]
 struct AppState {
     http: Client,
-    api_key: String,
+    api_key: String,      // OMDb API key
     cache: Cache<String, serde_json::Value>,
+    tmdb_key: String,     // <-- add TMDB key
 }
+
+#[derive(Debug, Deserialize)]
+struct TmdbList {
+    results: Vec<TmdbMovie>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmdbMovie {
+    id: u64,
+    title: Option<String>,
+    name: Option<String>, // fallback for TV shows
+}
+
+#[derive(Debug, Serialize)]
+struct CombinedMovie {
+    tmdb_title: String,
+    omdb: serde_json::Value,
+}
+
+
+
 
 #[derive(Debug, Error)]
 enum ApiError {
@@ -126,6 +151,7 @@ async fn main() -> io::Result<()> {
     fmt().with_env_filter(filter).init();
 
     let api_key = std::env::var("OMDB_API_KEY").expect("Defina OMDB_API_KEY no ambiente (.env)");
+    let tmdb_key = std::env::var("TMDB_API_KEY").expect("Defina TMDB_API_KEY no ambiente (.env)");
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -145,11 +171,12 @@ async fn main() -> io::Result<()> {
         .time_to_live(Duration::from_secs(60))
         .max_capacity(10_000)
         .build();
-
+        
     let state = AppState {
         http,
         api_key,
         cache,
+        tmdb_key,
     };
 
     // let app = Router::new()
@@ -173,6 +200,7 @@ async fn main() -> io::Result<()> {
         )
         // .route("/stream", axum::routing::get(download_and_stream))
         .route("/stream", axum::routing::get(download_and_stream))
+        .route("/movies/trending", get(movies_trending))
         .with_state(state)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
@@ -509,4 +537,101 @@ fn parse_range(range_str: &str, file_size: u64) -> Option<(u64, u64)> {
     }
 
     Some((start, end))
+}
+
+#[derive(Serialize)]
+struct OmdbMovieShort {
+    Poster: String,
+    Title: String,
+    Type: String,
+    Year: String,
+    imdbID: String,
+}
+
+async fn movies_trending(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let key = "movies:trending".to_string();
+    if let Some(cached) = state.cache.get(&key).await {
+        return Ok(Json(cached));
+    }
+
+    let client = &state.http;
+
+    // Get trending
+    let trending_url = format!(
+        "https://api.themoviedb.org/3/trending/movie/week?api_key={}",
+        state.tmdb_key
+    );
+    let trending: TmdbList = client
+        .get(&trending_url)
+        .send()
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+
+    // Get now playing
+    let releases_url = format!(
+        "https://api.themoviedb.org/3/movie/now_playing?api_key={}&language=en-US&page=1",
+        state.tmdb_key
+    );
+    let releases: TmdbList = client
+        .get(&releases_url)
+        .send()
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+
+    // Merge lists
+    let all = trending.results.into_iter().chain(releases.results);
+
+    let mut seen_ids = HashSet::new();
+    let mut combined: Vec<OmdbMovieShort> = Vec::new();
+
+    for m in all {
+        let title = m.title.or(m.name).unwrap_or_default();
+        if title.is_empty() {
+            continue;
+        }
+
+        let omdb_url = format!(
+            "https://www.omdbapi.com/?apikey={}&t={}&r=json",
+            state.api_key,
+            urlencoding::encode(&title)
+        );
+
+        if let Ok(resp) = client.get(&omdb_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(omdb_data) = resp.json::<serde_json::Value>().await {
+                    if omdb_data.get("Response") != Some(&serde_json::Value::String("False".into())) {
+                        if let Some(imdb_id) = omdb_data.get("imdbID").and_then(|v| v.as_str()) {
+                            if seen_ids.contains(imdb_id) {
+                                continue; // skip duplicates
+                            }
+                            seen_ids.insert(imdb_id.to_string());
+
+                            combined.push(OmdbMovieShort {
+                                Poster: omdb_data.get("Poster").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                                Title: omdb_data.get("Title").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                                Type: omdb_data.get("Type").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                                Year: omdb_data.get("Year").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                                imdbID: imdb_id.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let json = serde_json::json!({
+        "results": combined,
+        "total": combined.len().to_string(),
+        "type": "movie"
+    });
+
+    state.cache.insert(key, json.clone()).await;
+    Ok(Json(json))
 }
